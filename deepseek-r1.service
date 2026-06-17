@@ -1,0 +1,16 @@
+[Unit]
+Description=DeepSeek-R1 1.5B Q4_K_M llama-server
+After=network.target
+
+[Service]
+Type=simple
+User=mac
+WorkingDirectory=/home/mac/.agent-smith
+ExecStart=/home/mac/llama.cpp/build/bin/llama-server -m /home/mac/.agent-smith/models/deepseek-r1-1.5b/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf -c 4096 --host 0.0.0.0 --port 8081 -t 2 -b 512
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

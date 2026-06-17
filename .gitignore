@@ -1,0 +1,48 @@
+# Secrets and credentials
+.env
+.env.*
+config.yaml
+
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Models (large binary files - download separately)
+models/
+
+# Personal data
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Logs
+*.log
+logs/
+
+# Generated files
+audio/
+output/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker (optional - uncomment if not needed)
+# docker-compose.yml
+# Dockerfile

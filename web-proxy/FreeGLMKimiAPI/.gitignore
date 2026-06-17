@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.*
+!.env.example
+auth.json
+auth.jso
+auth.*.json
+*.log
+.DS_Store

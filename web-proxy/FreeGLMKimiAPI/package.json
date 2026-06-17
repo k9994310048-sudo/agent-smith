@@ -1,0 +1,38 @@
+{
+  "name": "free-glm-kimi-api",
+  "version": "0.1.0",
+  "description": "OpenAI/Anthropic-compatible free web API proxy for GLM and Kimi with prompt-simulated tool use.",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test tests/*.test.js",
+    "smoke": "node scripts/smoke.js",
+    "agent:hermes": "node scripts/agent_smoke.js hermes",
+    "agent:claude": "node scripts/agent_smoke.js claude",
+    "agent:opencode": "node scripts/agent_smoke.js opencode",
+    "agent:openclaw": "node scripts/agent_smoke.js openclaw",
+    "agent:all": "node scripts/agent_smoke.js all",
+    "doctor": "node scripts/doctor.js",
+    "smoke:zai": "node scripts/zai_real_smoke.js",
+    "auth:from-curl": "node scripts/import_zai_curl.js",
+    "auth:browser": "node scripts/zai_browser_auth.js"
+  },
+  "keywords": [
+    "glm",
+    "kimi",
+    "openai",
+    "anthropic",
+    "tool-calling",
+    "proxy"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "cloakbrowser": "^0.3.31",
+    "eventsource-parser": "^3.0.6",
+    "playwright-core": "^1.60.0",
+    "puppeteer-core": "^25.1.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}

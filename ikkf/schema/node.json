@@ -1,0 +1,23 @@
+{
+    "id": "node_uuid",
+    "type": "fact",
+    "content": "текст факта",
+    "embedding": [],
+    "context": {
+        "created": "2026-06-07T23:00:00Z",
+        "updated": "2026-06-07T23:00:00Z",
+        "source": "telegram",
+        "project": "spawnhere-memory",
+        "author": "OWL",
+        "confidence": 0.95,
+        "usage_count": 0,
+        "last_accessed": null
+    },
+    "tags": ["AI", "memory"],
+    "metadata": {
+        "language": "ru",
+        "importance": 0.8,
+        "emotional_weight": 0.5,
+        "verified": false
+    }
+}

@@ -1,0 +1,16 @@
+# IKKF — Зависимости
+
+# Core
+fastapi>=0.100.0
+uvicorn>=0.23.0
+
+# Storage
+# sqlite3 — встроен в Python
+
+# LLM (опционально, для парсинга)
+llama-cpp-python>=0.3.0
+
+# Old IKKF migration (опционально)
+chromadb>=0.4.0
+
+#sentence-transformers>=2.2.0  # для векторного поиска (опционально)

@@ -1,0 +1,17 @@
+{
+    "id": "edge_uuid",
+    "source": "node_uuid_1",
+    "target": "node_uuid_2",
+    "type": "related_to|created_by|part_of|depends_on|similar_to|contradicts|leads_to|instance_of",
+    "weight": 0.85,
+    "context": {
+        "created": "2026-06-07T23:00:00Z",
+        "confidence": 0.9,
+        "bidirectional": true,
+        "usage_count": 0
+    },
+    "metadata": {
+        "source": "inferred|manual|auto",
+        "verified": false
+    }
+}

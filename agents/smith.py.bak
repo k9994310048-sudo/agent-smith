@@ -1,0 +1,920 @@
+"""
+Agent Smith v4.8 -- Edge AGI Soul.
+Fixes: no repeat continue, dialog context, long answers to file.
+"""
+import json
+import logging
+import asyncio
+import os
+import subprocess
+import traceback
+import re
+import time as time_module
+from datetime import datetime
+from typing import AsyncGenerator, List, Dict, Any, Optional
+
+logger = logging.getLogger("agent-smith")
+PROJECT_ROOT = "/home/mac/.agent-smith"
+
+
+def md_to_html(text):
+    result = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    result = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', result)
+    result = re.sub(r'\*(.+?)\*', r'<i>\1</i>', result)
+    result = re.sub(r'`(.+?)`', r'<code>\1</code>', result)
+    result = re.sub(r'\[(.+?)\]\((https?://[^\)]+)\)', r'<a href="\2">\1</a>', result)
+    result = result.replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
+    result = result.replace("&lt;i&gt;", "<i>").replace("&lt;/i&gt;", "</i>")
+    result = result.replace("&lt;code&gt;", "<code>").replace("&lt;/code&gt;", "</code>")
+    return result
+
+
+def save_to_file(content, filename=None):
+    """Save long content to a file in PROJECT_ROOT/output/."""
+    if not filename:
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = "output_" + ts + ".md"
+    out_dir = os.path.join(PROJECT_ROOT, "output")
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, filename)
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return path
+    except Exception as e:
+        logger.error("save_to_file: " + str(e))
+        return None
+
+
+class AgentSmith:
+    def __init__(self):
+        self.state = "idle"
+        self.memory = {"facts": [], "conversations": []}
+        self.config = {}
+        self.llm = None
+        self.tools = None
+        self.ikkf = None
+        self.fact_extractor = None
+        self._initialized = False
+        self._recent_tool_calls = []
+        self._max_repeated_tools = 3
+        # Dialog context
+        self._dialog_history = []  # list of {"role": "user"/"assistant", "content": str}
+        self._last_analysis = ""   # last long analysis for continuity
+        self._dialog_topic = ""    # current topic
+
+    def get_status(self):
+        """Return current agent status for health dashboard."""
+        return {
+            "llm_mode": "hybrid",
+            "memory_facts": 0,
+            "skills_loaded": 3,
+            "config": {"uses_api": True}
+        }
+
+    async def initialize(self):
+        if self._initialized:
+            return
+        try:
+            logger.info("Init Agent Smith v4.8...")
+            from agents.llm_provider import LLMProvider
+            self.llm = LLMProvider(os.path.join(PROJECT_ROOT, "config.yaml"))
+            self.config = self.llm.cfg
+            from agents.tool_registry import get_registry
+            self.tools = get_registry()
+            from ikkf.graph import Graph
+            from agents.ikkf_bridge import IKKFBridge
+            os.makedirs(os.path.join(PROJECT_ROOT, "data"), exist_ok=True)
+            self.graph = Graph(os.path.join(PROJECT_ROOT, "data/graph.db"))
+            self.ikkf = IKKFBridge(local_graph=self.graph)
+            from agents.memory.fact_extractor import FactExtractor
+            from agents.autonomy.self_repair import SelfRepair
+            self.fact_extractor = FactExtractor(self.llm)
+            self.self_repair = SelfRepair(self)
+            self._load_memory()
+            self._initialized = True
+            logger.info("Agent Smith v4.8 Awakened.")
+        except Exception as e:
+            logger.error("Init failed: " + str(e))
+            raise
+
+    def _load_memory(self):
+        path = os.path.join(PROJECT_ROOT, "data/memory.json")
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    self.memory = json.load(f)
+            except:
+                pass
+
+    def _save_memory(self):
+        path = os.path.join(PROJECT_ROOT, "data/memory.json")
+        try:
+            with open(path, 'w') as f:
+                json.dump(self.memory, f, indent=2, ensure_ascii=False)
+        except:
+            pass
+
+    def _is_repeated_tool(self, tool_name):
+        self._recent_tool_calls.append(tool_name)
+        if len(self._recent_tool_calls) > 10:
+            self._recent_tool_calls = self._recent_tool_calls[-10:]
+        return self._recent_tool_calls.count(tool_name) >= self._max_repeated_tools
+
+    def _add_dialog_context(self, text, is_continuation):
+        """Add dialog history context for continuity."""
+        if not self._dialog_history:
+            return ""
+
+        # If continuing same topic, add brief summary
+        if is_continuation and self._last_analysis:
+            # Extract key points from last analysis (first 500 chars)
+            summary = self._last_analysis[:500]
+            return ("\n## ПРЕДЫДУЩИЙ АНАЛИЗ (кратко):\n" + summary +
+                    "\n\nПродолжай с того места, где остановился. НЕ повторяй уже сказанное.")
+        return ""
+
+    def get_system_prompt(self, context=""):
+        owner = self.config.get("agent", {}).get("owner", "UFO")
+        facts = "\n".join(["- " + f for f in self.memory.get("facts", [])[-10:]])
+        return (
+            "Tы — Agent Smith, автономный Edge AGI. Владелец: " + owner + ".\n"
+            "Корень: " + PROJECT_ROOT + ".\n\n"
+            "## ПРАВИЛА\n"
+            "1. Русский язык, Markdown (**bold**, *italic*, `code`, [links](url))\n"
+            "2. 'Ищи в интернете' -> ОБЯЗАТЕЛЬНО web_search с ссылками\n"
+            "3. НЕ повторяй одно действие >3 раз\n"
+            "4. Длинные ответы (>4000 зн.) -> сохраняй в файл output/NAME.md и давай ссылку\n\n"
+            "## ФОРМАТ\n"
+            "1. Краткий план (2-3 пункта)\n"
+            "2. Инструменты по необходимости\n"
+            "3. Подробный итог\n"
+            "4. Самопроверка\n\n"
+            "## СТОП-ПРАВИЛО\n"
+            "'После плана жди' / 'Жди команды':\n"
+            "- ТОЛЬКО план, без инструментов\n"
+            "- Заверши ответ\n\n"
+            "## ПРОДОЛЖЕНИЕ\n"
+            "'Продолжай' / 'Делай' / 'Давай':\n"
+            "- НЕ генерируй новый план\n"
+            "- Продолжай с места остановки\n"
+            "- НЕ повторяй уже сказанное\n\n"
+            "## ДЛИННЫЕ ОТВЕТЫ\n"
+            "Если ответ >4000 знаков:\n"
+            "- Сохрани полный текст в output/TOPIC.md через shell_exec\n"
+            "- В ответе дай краткую версию + путь к файлу\n\n"
+            "## Факты:\n" + (facts or "Нет.") + "\n" + (context or "") + "\n"
+        )
+
+    async def process_message_stream(self, text):
+        if not self._initialized:
+            await self.initialize()
+        from agents.core_system import get_core
+        core = get_core(self)
+        if core:
+            core.update_interaction()
+            core.set_busy(True)
+
+        self._recent_tool_calls = []
+        text_lower = text.lower()
+
+        # Detect patterns
+        stop_after_plan = any(p in text_lower for p in [
+            u"после плана жди",
+            u"жди команды",
+            u"сначала план",
+        ])
+        is_continuation = any(p in text_lower for p in [
+            u"продолжай", u"делай",
+            u"давай", u"давай дальше",
+            u"продолжай работу",
+            u"начинай", u"приступай",
+        ])
+        needs_web = any(p in text_lower for p in [
+            u"ищи в интернете",
+            u"найди лучшие",
+            "best practices",
+            u"поищи в интернете",
+        ])
+        is_architecture = any(p in text_lower for p in [
+            u"архитектур",
+            u"код", u"проект",
+            u"структур",
+        ])
+        save_to_file_cmd = any(p in text_lower for p in [
+            u"сохрани в файл",
+            u"в одном сообщении",
+            u"всё в одном", "in one message",
+        ])
+
+        max_tool_calls = 15 if is_architecture else 12
+        total_tool_calls = 0
+        start_time = time_module.time()
+        max_duration = 180
+        saved_file_path = None
+
+        try:
+            self.state = "perceive"
+            ikkf_results = self.ikkf.search(text, limit=3) or []
+            for r in ikkf_results:
+                if r.get("type") == "cached":
+                    yield {"content": r["node"]["content"]}
+                    return
+
+            mem_ctx = ""
+            if ikkf_results:
+                mem_ctx = u"\n## Граф:\n" + "\n".join(
+                    ["- " + r["node"]["content"] for r in ikkf_results])
+
+            # Dialog context
+            dialog_ctx = self._add_dialog_context(text, is_continuation)
+
+            messages = [
+                {"role": "system", "content": self.get_system_prompt(mem_ctx + dialog_ctx)},
+                {"role": "user", "content": text}
+            ]
+
+            if is_continuation:
+                _ctx = "[CONTEXT: Продолжение. Новый план НЕ нужен. Продолжай с места остановки.]"
+                messages.insert(1, {"role": "system", "content": _ctx})
+
+            full_content = ""
+            max_iter = 1 if stop_after_plan else 5
+
+            for iteration in range(max_iter):
+                if time_module.time() - start_time > max_duration:
+                    yield {"content": u"\n\n[TIME] Лимит 3 мин. Итог..."}
+                    messages.append({"role": "user",
+                        "content": u"Время вышло. Дай итог на основе собранного."})
+                    async for delta in self.llm.generate_stream(messages, tools=None, max_tokens=2000):
+                        if not delta:
+                            continue
+                        c = delta.get("content")
+                        if c:
+                            full_content += c
+                            yield {"content": c}
+                    break
+
+                self.state = "thinking"
+                tool_calls_map = {}
+
+                async for delta in self.llm.generate_stream(
+                        messages, tools=self.tools.get_schemas()):
+                    if not delta:
+                        continue
+                    content = delta.get("content")
+                    if content:
+                        full_content += content
+                        yield {"content": content}
+                    t_calls = delta.get("tool_calls")
+                    if t_calls:
+                        for tc in t_calls:
+                            idx = tc.get("index", 0)
+                            if idx not in tool_calls_map:
+                                tool_calls_map[idx] = {
+                                    "id": tc.get("id"), "name": "", "args": ""
+                                }
+                            if tc.get("id"):
+                                tool_calls_map[idx]["id"] = tc["id"]
+                            fn = tc.get("function", {})
+                            if fn.get("name"):
+                                tool_calls_map[idx]["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                tool_calls_map[idx]["args"] += fn["arguments"]
+
+                if not tool_calls_map:
+                    break
+
+                if stop_after_plan:
+                    yield {"content": u"\n\n[PLAN] План готов. Жду команды."}
+                    break
+
+                total_tool_calls += len(tool_calls_map)
+
+                # Force web search early
+                if needs_web and iteration == 0:
+                    has_web = any(c["name"] == "web_search" for c in tool_calls_map.values())
+                    if not has_web:
+                        yield {"content": u"\n[WEB] Ищу в интернете..."}
+                        try:
+                            ws_result = await asyncio.get_event_loop().run_in_executor(
+                                None, self.tools.execute, "web_search",
+                                {"query": text[:100], "max_results": 5}
+                            )
+                            ws_res = str(ws_result)[:3000]
+                            messages.append({"role": "tool", "tool_call_id": "ws_0",
+                                             "name": "web_search", "content": ws_res})
+                            total_tool_calls += 1
+                        except Exception as e:
+                            messages.append({"role": "tool", "tool_call_id": "ws_0",
+                                             "name": "web_search", "content": "Error: " + str(e)})
+
+                # Tool limit
+                if total_tool_calls >= max_tool_calls:
+                    yield {"content": u"\n\n[LIMIT] Лимит. Итог..."}
+                    messages.append({"role": "user",
+                        "content": u"Инструменты НЕ доступны. Дай ПОДРОБНЫй итог.\n"
+                                   u"Самопроверка: все ли пункты запроса покрыты?"})
+                    async for delta in self.llm.generate_stream(messages, tools=None, max_tokens=3000):
+                        if not delta:
+                            continue
+                        c = delta.get("content")
+                        if c:
+                            full_content += c
+                            yield {"content": c}
+                    break
+
+                self.state = "acting"
+                messages.append({"role": "assistant", "content": full_content})
+
+                for idx in sorted(tool_calls_map.keys()):
+                    tc = tool_calls_map[idx]
+                    if not tc["name"]:
+                        continue
+                    if self._is_repeated_tool(tc["name"]):
+                        yield {"content": "\n[SKIP] " + tc["name"] + u" (уже 3 раз)"}
+                        messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                         "name": tc["name"],
+                                         "content": "Skipped: called 3+ times"})
+                        continue
+                    yield {"content": "\n> " + tc["name"]}
+                    try:
+                        args = json.loads(tc["args"] or "{}")
+                        # Run with timeout to prevent blocking
+                        loop = asyncio.get_event_loop()
+                        result = await asyncio.wait_for(
+                            loop.run_in_executor(None, self.tools.execute, tc["name"], args),
+                            timeout=30.0
+                        )
+                        msg_res = str(result)[:2000]
+                        messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                         "name": tc["name"], "content": msg_res})
+                    except Exception as e:
+                        messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                         "name": tc["name"], "content": "Error: " + str(e)})
+
+                yield {"content": "\n[ITER] " + str(iteration + 1) + " (" + str(total_tool_calls) + ")"}
+
+                # Remind LLM about the current task to prevent forgetting
+                if iteration < 3 and total_tool_calls < max_tool_calls - 2:
+                    _task = "[TASK REMINDER: Ты выполняешь задачу: " + text[:100] + ". Продолжай выполнение. НЕ здоровайся, НЕ начинай заново.]"
+                    messages.append({"role": "system", "content": _task})
+
+                tool_msgs = [m for m in messages if m.get("role") == "tool"]
+                if len(tool_msgs) > 8:
+                    non_tool = [m for m in messages if m.get("role") != "tool"]
+                    messages = non_tool + tool_msgs[-6:]
+
+            # Save to file if needed
+            if save_to_file_cmd or len(full_content) > 5000:
+                topic = self._dialog_topic or "analysis"
+                safe_name = re.sub(r'[^\w\-]', '_', topic)[:50]
+                fname = safe_name + "_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S") + ".md"
+                saved_path = save_to_file(full_content, fname)
+                if saved_path:
+                    saved_file_path = saved_path
+                    yield {"content": u"\n\n[ФАЙЛ] Полный отчет: " + saved_path}
+
+            # Save to dialog history
+            self._dialog_history.append({"role": "user", "content": text[:200]})
+            self._dialog_history.append({"role": "assistant", "content": full_content[:500]})
+            if len(self._dialog_history) > 20:
+                self._dialog_history = self._dialog_history[-20:]
+            self._last_analysis = full_content
+            if not self._dialog_topic:
+                self._dialog_topic = text[:50]
+
+            # LEARN
+            self.state = "learning"
+            asyncio.create_task(self._learn(text, full_content))
+
+        except Exception as e:
+            logger.error("Error: " + str(e) + "\n" + traceback.format_exc())
+            yield {"content": "\n\n[ERROR] " + str(e)}
+        finally:
+            self.state = "idle"
+            if core:
+                core.set_busy(False)
+
+    async def _learn(self, u, a):
+        try:
+            new_facts = await self.fact_extractor.extract(u, a)
+            for f in new_facts:
+                if f and f.get("content"):
+                    self.memory["facts"].append(f["content"])
+                    self.ikkf.store(f["content"], importance=f.get("importance", 0.5))
+            if len(self.memory["facts"]) > 50:
+                self.memory["facts"] = self.memory["facts"][-50:]
+            self._save_memory()
+        except:
+            pass
+
+    async def self_correct(self):
+        try:
+            if not self.ikkf or not self.ikkf.health():
+                return
+            recent = self.ikkf.search("", limit=20) or []
+            if len(recent) < 2:
+                return
+            result = await self.llm.generate(
+                messages=[{"role": "user", "content": "Check for contradictions or say OK:\n" +
+                          "\n".join(["- " + r["node"]["content"] for r in recent])}],
+                max_tokens=512)
+            ct = result.get("content", "").strip()
+            if ct and ct != "OK":
+                self.ikkf.store(
+                    content="[Self-correction " + datetime.utcnow().isoformat()[:10] + "] " + ct,
+                    node_type="fact", importance=0.6)
+        except Exception as e:
+            logger.error("Self-correction: " + str(e))
+
+    async def dream(self):
+        try:
+            ds = os.path.join(PROJECT_ROOT, "ikkf", "ikkf_dream.py")
+            if not os.path.exists(ds):
+                return
+            result = subprocess.run(
+                ["python3", ds, "--once", "--facts", "4"],
+                capture_output=True, text=True, timeout=300, cwd=PROJECT_ROOT)
+            if result.returncode != 0:
+                logger.error("Dream: " + result.stderr[:200])
+        except Exception as e:
+            logger.error("Dream: " + str(e))
+    async def send_morning_delivery(self):
+        Отправить утреннее сообщение с топ-идеями в Telegram.
+        try:
+            msg_file = os.path.join(PROJECT_ROOT, data, morning-message.txt)
+            if not os.path.exists(msg_file):
+                return
+            with open(msg_file, r) as f:
+                msg = f.read()
+            if not msg.strip():
+                return
+            if hasattr(self, telegram) and self.telegram:
+                await self.telegram.send_message(msg)
+                logger.info(Morning delivery sent via Telegram)
+            else:
+                logger.info(Morning delivery: no telegram bot available)
+        except Exception as e:
+            logger.error(fMorning delivery error: {e})
+
+"""
+Agent Smith v4.8 -- Edge AGI Soul.
+Fixes: no repeat continue, dialog context, long answers to file.
+"""
+import json
+import logging
+import asyncio
+import os
+import subprocess
+import traceback
+import re
+import time as time_module
+from datetime import datetime
+from typing import AsyncGenerator, List, Dict, Any, Optional
+
+logger = logging.getLogger("agent-smith")
+PROJECT_ROOT = "/home/mac/.agent-smith"
+
+
+def md_to_html(text):
+    result = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    result = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', result)
+    result = re.sub(r'\*(.+?)\*', r'<i>\1</i>', result)
+    result = re.sub(r'`(.+?)`', r'<code>\1</code>', result)
+    result = re.sub(r'\[(.+?)\]\((https?://[^\)]+)\)', r'<a href="\2">\1</a>', result)
+    result = result.replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
+    result = result.replace("&lt;i&gt;", "<i>").replace("&lt;/i&gt;", "</i>")
+    result = result.replace("&lt;code&gt;", "<code>").replace("&lt;/code&gt;", "</code>")
+    return result
+
+
+def save_to_file(content, filename=None):
+    """Save long content to a file in PROJECT_ROOT/output/."""
+    if not filename:
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = "output_" + ts + ".md"
+    out_dir = os.path.join(PROJECT_ROOT, "output")
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, filename)
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        return path
+    except Exception as e:
+        logger.error("save_to_file: " + str(e))
+        return None
+
+
+class AgentSmith:
+    def __init__(self):
+        self.state = "idle"
+        self.memory = {"facts": [], "conversations": []}
+        self.config = {}
+        self.llm = None
+        self.tools = None
+        self.ikkf = None
+        self.fact_extractor = None
+        self._initialized = False
+        self._recent_tool_calls = []
+        self._max_repeated_tools = 3
+        # Dialog context
+        self._dialog_history = []  # list of {"role": "user"/"assistant", "content": str}
+        self._last_analysis = ""   # last long analysis for continuity
+        self._dialog_topic = ""    # current topic
+
+    def get_status(self):
+        """Return current agent status for health dashboard."""
+        return {
+            "llm_mode": "hybrid",
+            "memory_facts": 0,
+            "skills_loaded": 3,
+            "config": {"uses_api": True}
+        }
+
+    async def initialize(self):
+        if self._initialized:
+            return
+        try:
+            logger.info("Init Agent Smith v4.8...")
+            from agents.llm_provider import LLMProvider
+            self.llm = LLMProvider(os.path.join(PROJECT_ROOT, "config.yaml"))
+            self.config = self.llm.cfg
+            from agents.tool_registry import get_registry
+            self.tools = get_registry()
+            from ikkf.graph import Graph
+            from agents.ikkf_bridge import IKKFBridge
+            os.makedirs(os.path.join(PROJECT_ROOT, "data"), exist_ok=True)
+            self.graph = Graph(os.path.join(PROJECT_ROOT, "data/graph.db"))
+            self.ikkf = IKKFBridge(local_graph=self.graph)
+            from agents.memory.fact_extractor import FactExtractor
+            from agents.autonomy.self_repair import SelfRepair
+            self.fact_extractor = FactExtractor(self.llm)
+            self.self_repair = SelfRepair(self)
+            self._load_memory()
+            self._initialized = True
+            logger.info("Agent Smith v4.8 Awakened.")
+        except Exception as e:
+            logger.error("Init failed: " + str(e))
+            raise
+
+    def _load_memory(self):
+        path = os.path.join(PROJECT_ROOT, "data/memory.json")
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    self.memory = json.load(f)
+            except:
+                pass
+
+    def _save_memory(self):
+        path = os.path.join(PROJECT_ROOT, "data/memory.json")
+        try:
+            with open(path, 'w') as f:
+                json.dump(self.memory, f, indent=2, ensure_ascii=False)
+        except:
+            pass
+
+    def _is_repeated_tool(self, tool_name):
+        self._recent_tool_calls.append(tool_name)
+        if len(self._recent_tool_calls) > 10:
+            self._recent_tool_calls = self._recent_tool_calls[-10:]
+        return self._recent_tool_calls.count(tool_name) >= self._max_repeated_tools
+
+    def _add_dialog_context(self, text, is_continuation):
+        """Add dialog history context for continuity."""
+        if not self._dialog_history:
+            return ""
+
+        # If continuing same topic, add brief summary
+        if is_continuation and self._last_analysis:
+            # Extract key points from last analysis (first 500 chars)
+            summary = self._last_analysis[:500]
+            return ("\n## ПРЕДЫДУЩИЙ АНАЛИЗ (кратко):\n" + summary +
+                    "\n\nПродолжай с того места, где остановился. НЕ повторяй уже сказанное.")
+        return ""
+
+    def get_system_prompt(self, context=""):
+        owner = self.config.get("agent", {}).get("owner", "UFO")
+        facts = "\n".join(["- " + f for f in self.memory.get("facts", [])[-10:]])
+        return (
+            "Tы — Agent Smith, автономный Edge AGI. Владелец: " + owner + ".\n"
+            "Корень: " + PROJECT_ROOT + ".\n\n"
+            "## ПРАВИЛА\n"
+            "1. Русский язык, Markdown (**bold**, *italic*, `code`, [links](url))\n"
+            "2. 'Ищи в интернете' -> ОБЯЗАТЕЛЬНО web_search с ссылками\n"
+            "3. НЕ повторяй одно действие >3 раз\n"
+            "4. Длинные ответы (>4000 зн.) -> сохраняй в файл output/NAME.md и давай ссылку\n\n"
+            "## ФОРМАТ\n"
+            "1. Краткий план (2-3 пункта)\n"
+            "2. Инструменты по необходимости\n"
+            "3. Подробный итог\n"
+            "4. Самопроверка\n\n"
+            "## СТОП-ПРАВИЛО\n"
+            "'После плана жди' / 'Жди команды':\n"
+            "- ТОЛЬКО план, без инструментов\n"
+            "- Заверши ответ\n\n"
+            "## ПРОДОЛЖЕНИЕ\n"
+            "'Продолжай' / 'Делай' / 'Давай':\n"
+            "- НЕ генерируй новый план\n"
+            "- Продолжай с места остановки\n"
+            "- НЕ повторяй уже сказанное\n\n"
+            "## ДЛИННЫЕ ОТВЕТЫ\n"
+            "Если ответ >4000 знаков:\n"
+            "- Сохрани полный текст в output/TOPIC.md через shell_exec\n"
+            "- В ответе дай краткую версию + путь к файлу\n\n"
+            "## Факты:\n" + (facts or "Нет.") + "\n" + (context or "") + "\n"
+        )
+
+    async def process_message_stream(self, text):
+        if not self._initialized:
+            await self.initialize()
+        from agents.core_system import get_core
+        core = get_core(self)
+        if core:
+            core.update_interaction()
+            core.set_busy(True)
+
+        self._recent_tool_calls = []
+        text_lower = text.lower()
+
+        # Detect patterns
+        stop_after_plan = any(p in text_lower for p in [
+            u"после плана жди",
+            u"жди команды",
+            u"сначала план",
+        ])
+        is_continuation = any(p in text_lower for p in [
+            u"продолжай", u"делай",
+            u"давай", u"давай дальше",
+            u"продолжай работу",
+            u"начинай", u"приступай",
+        ])
+        needs_web = any(p in text_lower for p in [
+            u"ищи в интернете",
+            u"найди лучшие",
+            "best practices",
+            u"поищи в интернете",
+        ])
+        is_architecture = any(p in text_lower for p in [
+            u"архитектур",
+            u"код", u"проект",
+            u"структур",
+        ])
+        save_to_file_cmd = any(p in text_lower for p in [
+            u"сохрани в файл",
+            u"в одном сообщении",
+            u"всё в одном", "in one message",
+        ])
+
+        max_tool_calls = 15 if is_architecture else 12
+        total_tool_calls = 0
+        start_time = time_module.time()
+        max_duration = 180
+        saved_file_path = None
+
+        try:
+            self.state = "perceive"
+            ikkf_results = self.ikkf.search(text, limit=3) or []
+            for r in ikkf_results:
+                if r.get("type") == "cached":
+                    yield {"content": r["node"]["content"]}
+                    return
+
+            mem_ctx = ""
+            if ikkf_results:
+                mem_ctx = u"\n## Граф:\n" + "\n".join(
+                    ["- " + r["node"]["content"] for r in ikkf_results])
+
+            # Dialog context
+            dialog_ctx = self._add_dialog_context(text, is_continuation)
+
+            messages = [
+                {"role": "system", "content": self.get_system_prompt(mem_ctx + dialog_ctx)},
+                {"role": "user", "content": text}
+            ]
+
+            if is_continuation:
+                _ctx = "[CONTEXT: Продолжение. Новый план НЕ нужен. Продолжай с места остановки.]"
+                messages.insert(1, {"role": "system", "content": _ctx})
+
+            full_content = ""
+            max_iter = 1 if stop_after_plan else 5
+
+            for iteration in range(max_iter):
+                if time_module.time() - start_time > max_duration:
+                    yield {"content": u"\n\n[TIME] Лимит 3 мин. Итог..."}
+                    messages.append({"role": "user",
+                        "content": u"Время вышло. Дай итог на основе собранного."})
+                    async for delta in self.llm.generate_stream(messages, tools=None, max_tokens=2000):
+                        if not delta:
+                            continue
+                        c = delta.get("content")
+                        if c:
+                            full_content += c
+                            yield {"content": c}
+                    break
+
+                self.state = "thinking"
+                tool_calls_map = {}
+
+                async for delta in self.llm.generate_stream(
+                        messages, tools=self.tools.get_schemas()):
+                    if not delta:
+                        continue
+                    content = delta.get("content")
+                    if content:
+                        full_content += content
+                        yield {"content": content}
+                    t_calls = delta.get("tool_calls")
+                    if t_calls:
+                        for tc in t_calls:
+                            idx = tc.get("index", 0)
+                            if idx not in tool_calls_map:
+                                tool_calls_map[idx] = {
+                                    "id": tc.get("id"), "name": "", "args": ""
+                                }
+                            if tc.get("id"):
+                                tool_calls_map[idx]["id"] = tc["id"]
+                            fn = tc.get("function", {})
+                            if fn.get("name"):
+                                tool_calls_map[idx]["name"] = fn["name"]
+                            if fn.get("arguments"):
+                                tool_calls_map[idx]["args"] += fn["arguments"]
+
+                if not tool_calls_map:
+                    break
+
+                if stop_after_plan:
+                    yield {"content": u"\n\n[PLAN] План готов. Жду команды."}
+                    break
+
+                total_tool_calls += len(tool_calls_map)
+
+                # Force web search early
+                if needs_web and iteration == 0:
+                    has_web = any(c["name"] == "web_search" for c in tool_calls_map.values())
+                    if not has_web:
+                        yield {"content": u"\n[WEB] Ищу в интернете..."}
+                        try:
+                            ws_result = await asyncio.get_event_loop().run_in_executor(
+                                None, self.tools.execute, "web_search",
+                                {"query": text[:100], "max_results": 5}
+                            )
+                            ws_res = str(ws_result)[:3000]
+                            messages.append({"role": "tool", "tool_call_id": "ws_0",
+                                             "name": "web_search", "content": ws_res})
+                            total_tool_calls += 1
+                        except Exception as e:
+                            messages.append({"role": "tool", "tool_call_id": "ws_0",
+                                             "name": "web_search", "content": "Error: " + str(e)})
+
+                # Tool limit
+                if total_tool_calls >= max_tool_calls:
+                    yield {"content": u"\n\n[LIMIT] Лимит. Итог..."}
+                    messages.append({"role": "user",
+                        "content": u"Инструменты НЕ доступны. Дай ПОДРОБНЫй итог.\n"
+                                   u"Самопроверка: все ли пункты запроса покрыты?"})
+                    async for delta in self.llm.generate_stream(messages, tools=None, max_tokens=3000):
+                        if not delta:
+                            continue
+                        c = delta.get("content")
+                        if c:
+                            full_content += c
+                            yield {"content": c}
+                    break
+
+                self.state = "acting"
+                messages.append({"role": "assistant", "content": full_content})
+
+                for idx in sorted(tool_calls_map.keys()):
+                    tc = tool_calls_map[idx]
+                    if not tc["name"]:
+                        continue
+                    if self._is_repeated_tool(tc["name"]):
+                        yield {"content": "\n[SKIP] " + tc["name"] + u" (уже 3 раз)"}
+                        messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                         "name": tc["name"],
+                                         "content": "Skipped: called 3+ times"})
+                        continue
+                    yield {"content": "\n> " + tc["name"]}
+                    try:
+                        args = json.loads(tc["args"] or "{}")
+                        # Run with timeout to prevent blocking
+                        loop = asyncio.get_event_loop()
+                        result = await asyncio.wait_for(
+                            loop.run_in_executor(None, self.tools.execute, tc["name"], args),
+                            timeout=30.0
+                        )
+                        msg_res = str(result)[:2000]
+                        messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                         "name": tc["name"], "content": msg_res})
+                    except Exception as e:
+                        messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                         "name": tc["name"], "content": "Error: " + str(e)})
+
+                yield {"content": "\n[ITER] " + str(iteration + 1) + " (" + str(total_tool_calls) + ")"}
+
+                # Remind LLM about the current task to prevent forgetting
+                if iteration < 3 and total_tool_calls < max_tool_calls - 2:
+                    _task = "[TASK REMINDER: Ты выполняешь задачу: " + text[:100] + ". Продолжай выполнение. НЕ здоровайся, НЕ начинай заново.]"
+                    messages.append({"role": "system", "content": _task})
+
+                tool_msgs = [m for m in messages if m.get("role") == "tool"]
+                if len(tool_msgs) > 8:
+                    non_tool = [m for m in messages if m.get("role") != "tool"]
+                    messages = non_tool + tool_msgs[-6:]
+
+            # Save to file if needed
+            if save_to_file_cmd or len(full_content) > 5000:
+                topic = self._dialog_topic or "analysis"
+                safe_name = re.sub(r'[^\w\-]', '_', topic)[:50]
+                fname = safe_name + "_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S") + ".md"
+                saved_path = save_to_file(full_content, fname)
+                if saved_path:
+                    saved_file_path = saved_path
+                    yield {"content": u"\n\n[ФАЙЛ] Полный отчет: " + saved_path}
+
+            # Save to dialog history
+            self._dialog_history.append({"role": "user", "content": text[:200]})
+            self._dialog_history.append({"role": "assistant", "content": full_content[:500]})
+            if len(self._dialog_history) > 20:
+                self._dialog_history = self._dialog_history[-20:]
+            self._last_analysis = full_content
+            if not self._dialog_topic:
+                self._dialog_topic = text[:50]
+
+            # LEARN
+            self.state = "learning"
+            asyncio.create_task(self._learn(text, full_content))
+
+        except Exception as e:
+            logger.error("Error: " + str(e) + "\n" + traceback.format_exc())
+            yield {"content": "\n\n[ERROR] " + str(e)}
+        finally:
+            self.state = "idle"
+            if core:
+                core.set_busy(False)
+
+    async def _learn(self, u, a):
+        try:
+            new_facts = await self.fact_extractor.extract(u, a)
+            for f in new_facts:
+                if f and f.get("content"):
+                    self.memory["facts"].append(f["content"])
+                    self.ikkf.store(f["content"], importance=f.get("importance", 0.5))
+            if len(self.memory["facts"]) > 50:
+                self.memory["facts"] = self.memory["facts"][-50:]
+            self._save_memory()
+        except:
+            pass
+
+    async def self_correct(self):
+        try:
+            if not self.ikkf or not self.ikkf.health():
+                return
+            recent = self.ikkf.search("", limit=20) or []
+            if len(recent) < 2:
+                return
+            result = await self.llm.generate(
+                messages=[{"role": "user", "content": "Check for contradictions or say OK:\n" +
+                          "\n".join(["- " + r["node"]["content"] for r in recent])}],
+                max_tokens=512)
+            ct = result.get("content", "").strip()
+            if ct and ct != "OK":
+                self.ikkf.store(
+                    content="[Self-correction " + datetime.utcnow().isoformat()[:10] + "] " + ct,
+                    node_type="fact", importance=0.6)
+        except Exception as e:
+            logger.error("Self-correction: " + str(e))
+
+    async def dream(self):
+        try:
+            ds = os.path.join(PROJECT_ROOT, "ikkf", "ikkf_dream.py")
+            if not os.path.exists(ds):
+                return
+            result = subprocess.run(
+                ["python3", ds, "--once", "--facts", "4"],
+                capture_output=True, text=True, timeout=300, cwd=PROJECT_ROOT)
+            if result.returncode != 0:
+                logger.error("Dream: " + result.stderr[:200])
+        except Exception as e:
+            logger.error("Dream: " + str(e))
+            async def send_morning_delivery(self):
+        Отправить утреннее сообщение с топ-идеями в Telegram.
+        try:
+            msg_file = os.path.join(PROJECT_ROOT, data, morning-message.txt)
+            if not os.path.exists(msg_file):
+                return
+            with open(msg_file, r) as f:
+                msg = f.read()
+            if not msg.strip():
+                return
+            if hasattr(self, telegram) and self.telegram:
+                await self.telegram.send_message(msg)
+                logger.info(Morning delivery sent via Telegram)
+            else:
+                logger.info(Morning delivery: no telegram bot available)
+        except Exception as e:
+            logger.error(fMorning delivery error: {e})
+

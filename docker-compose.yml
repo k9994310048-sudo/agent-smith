@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  agent-smith:
+    build: .
+    container_name: agent-smith
+    restart: unless-stopped
+    ports:
+      - "8766:8766"
+      - "8767:8767"
+      - "8768:8768"
+    volumes:
+      - agent-data:/root/.agent-smith
+      - ./models:/app/models
+    environment:
+      - PYTHONUNBUFFERED=1
+      - IKKF_API_URL=http://localhost:8766
+
+volumes:
+  agent-data:
