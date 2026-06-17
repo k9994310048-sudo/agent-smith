@@ -14,6 +14,10 @@ Agent Smith is a fully autonomous AI agent designed to run on low-end hardware. 
 
 > **Philosophy:** "If it works on trash, it works everywhere." — Designed for a 2012 MacBook Pro with i5-2435M and 16GB RAM.
 
+> ⚠️ **Development Status:** This project is in active development. Many features are experimental, bugs are expected, and the API may change. The core idea works — an autonomous agent with graph memory, self-healing, and a cognitive loop. But it is not production-ready. Use at your own risk.
+
+
+
 > ⚠️ **Проект в стадии активной разработки.** Работает основная идея — граф знаний, когнитивная петля, самовосстановление — но много недочётов, не всё протестировано. Используйте на свой страх и риск. Буду рад любой обратной связи и contributions!
 
 
