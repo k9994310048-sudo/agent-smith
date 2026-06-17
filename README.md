@@ -8,8 +8,7 @@
 
 Agent Smith is a fully autonomous AI agent designed to run on low-end hardware. It features a graph-based memory system (IKKF), self-healing capabilities, multimodal interaction (text-to-speech, speech recognition), and a cognitive loop that generates ideas while you sleep.
 
-> ⚠️ **Статус проекта:** Активная разработка (alpha). Идея работает, но много недочётов. Код пишется итеративно, архитектура может меняться. Используйте на свой страх и риск. Буду рад фидбеку и контрибуциям.
-
+> ⚠️ Project Status: Active Development (alpha). The core idea works, but there are many rough edges. Code is written iteratively, and architecture may change. Use at your own risk. Feedback and contributions are welcome.
 
 
 > **Philosophy:** "If it works on trash, it works everywhere." — Designed for a 2012 MacBook Pro with i5-2435M and 16GB RAM.
@@ -18,7 +17,7 @@ Agent Smith is a fully autonomous AI agent designed to run on low-end hardware. 
 
 
 
-> ⚠️ **Проект в стадии активной разработки.** Работает основная идея — граф знаний, когнитивная петля, самовосстановление — но много недочётов, не всё протестировано. Используйте на свой страх и риск. Буду рад любой обратной связи и contributions!
+> ⚠️ Project in active development. The core idea works — knowledge graph, cognitive loop, self-recovery — but there are many rough edges, not everything is tested. Use at your own risk. Any feedback and contributions are welcome!
 
 
 
